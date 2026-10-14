@@ -228,13 +228,21 @@ class PromptBuilderTests(unittest.TestCase):
         self.assertIn("[Reminder]: Respond with a single valid JSON object only.", prompt)
 
     def test_large_tool_lists_are_slimmed(self):
-        big = [_tool(f"t{i}", **{f"p{j}": "string" for j in range(30)}) for i in range(60)]
+        big = [_tool(f"big_t{i}", **{f"p{j}": "string" for j in range(30)}) for i in range(60)]
         for t in big:
             for p in t["function"]["parameters"]["properties"].values():
                 p["description"] = "x" * 40
-        prompt, _ = messages_to_prompt([{"role": "user", "content": "hi"}], big)
-        self.assertLess(len(prompt), 40000)
-        self.assertIn('"name": "t59"', prompt)
+        core = [_tool("read", filePath="string"), _tool("bash", command="string")]
+        core[1]["function"]["description"] = "Run a command. " * 600  # very long, like opencode's bash
+        mcp = [_tool(f"mcp_srv_{i}", **{f"p{j}": "string" for j in range(30)}) for i in range(150)]
+        prompt, _ = messages_to_prompt([{"role": "user", "content": "hi"}], big + core + mcp)
+        self.assertLess(len(prompt), 70000)
+        lines = {json.loads(l)["name"]: json.loads(l) for l in prompt.split("Available tools:\n", 1)[1]
+                 .split("\n\n", 1)[0].splitlines()}
+        self.assertEqual(len(lines), 212)  # every tool is still listed
+        self.assertIn("parameters", lines["read"])  # core tools keep full schemas
+        self.assertIn("parameters", lines["bash"])
+        self.assertIn("parameter_names", lines["mcp_srv_0"])  # big MCP groups are slimmed
 
 
 class ResponsesInputTests(unittest.TestCase):
@@ -286,9 +294,25 @@ class CannedReplyTests(unittest.TestCase):
                      "I\u2019m having a hard time fulfilling your request."):
             self.assertEqual(classify_canned(text), "failure", text)
         self.assertEqual(classify_canned("I'm just a language model, so I can't help you with that."), "refusal")
+        # Observed with opencode; long, but still a failure.
+        long_fail = ("I cannot execute tools directly because the tool call limit has been reached. However, "
+                     "to fix util.py you will typically want to inspect it. " + "More advice. " * 40)
+        self.assertEqual(classify_canned(long_fail), "refusal")
+        for text in ("I am unable to use the file tools because my tool calls are exhausted for this session.",
+                     "I am unable to execute tool calls as the maximum call limit has been reached, but here",
+                     "I cannot make any further tool calls since the maximum limit has been reached.",
+                     "I am unable to search the project files because the search tools are currently unavailable.",
+                     "The search tools are currently unavailable in this environment, so I am unable to search.",
+                     "I am unable to access the search or file tools to inspect the project contents directly.",
+                     "I am unable to run search tools to locate files mentioning the word due to system limits.",
+                     "I am unable to search the project files for the word without tool access."):
+            self.assertEqual(classify_canned(text + " " + "x" * 400), "refusal", text)
+        self.assertEqual(classify_canned("I cannot execute additional tool calls because the maximum limit "
+                                         "has been reached. However, here is the code: " + "x" * 400), "refusal")
 
     def test_real_answers_are_not_canned(self):
         self.assertIsNone(classify_canned("2 + 2 = 4"))
+        self.assertIsNone(classify_canned("The weather tool is unavailable in your region, so I used search. " * 5))
         self.assertIsNone(classify_canned("Sorry, something went wrong in your code: " + "x" * 400))
 
 
@@ -316,6 +340,19 @@ class CompleteTests(_ConfigMixin, unittest.TestCase):
         self.assertEqual((result.text, result.tool_calls), ("2 + 2 = 4", []))
         self.assertIn("[Correction]:", gen.prompts[1])
         self.assertIn("google:ds_python_interpreter: tool is not declared", gen.prompts[1])
+
+    def test_tutorial_reply_gets_one_nudge(self):
+        # Observed with opencode: code shown instead of an edit tool call.
+        tutorial = "Here are the changes:\n\n### 1. Update `util.py`\n```python\ndef subtract(a, b):\n    return a - b\n```"
+        gen = _FakeGen(tutorial, _call("write_file", {"path": "util.py", "content": "x"}))
+        self.assertEqual(complete(gen, CompletionRequest("p", TOOLS)).finish_reason, "tool_calls")
+        self.assertIn("described the changes instead of making them", gen.prompts[1])
+        # Without tools, or for ordinary answers, no retry happens.
+        gen = _FakeGen(tutorial)
+        complete(gen, CompletionRequest("p"))
+        gen2 = _FakeGen("The answer is 391.")
+        complete(gen2, CompletionRequest("p", TOOLS))
+        self.assertEqual((len(gen.prompts), len(gen2.prompts)), (1, 1))
 
     def test_forced_tool_choice_is_enforced(self):
         gen = _FakeGen("Hello! How can I help?", _call("get_weather", {"city": "Paris"}))
@@ -385,6 +422,21 @@ class CompleteStreamTests(_ConfigMixin, unittest.TestCase):
         self.assertFalse([v for k, v in events if k == "text"])
         self.assertEqual(events[-1], ("finish", "tool_calls"))
         self.assertEqual(len(gen.prompts), 2)
+
+    def test_long_tool_limit_refusal_is_retried_in_stream(self):
+        refusal = "I cannot execute tools directly because the tool call limit has been reached. However, " + "advice " * 80
+        gen = _FakeGen(refusal, _call("read_file", {"path": "a"}))
+        events = self._run(gen, CompletionRequest("p", TOOLS))
+        self.assertFalse([v for k, v in events if k == "text"])
+        self.assertEqual(events[-1], ("finish", "tool_calls"))
+
+    def test_tutorial_reply_is_held_and_retried_in_stream(self):
+        tutorial = ("To complete your request, here are the changes you can make to the project files. " * 3 +
+                    "\n```python\ndef subtract(a, b):\n    return a - b\n```")
+        gen = _FakeGen(tutorial, _call("write_file", {"path": "util.py", "content": "x"}))
+        events = self._run(gen, CompletionRequest("p", TOOLS))
+        self.assertFalse([v for k, v in events if k == "text"])
+        self.assertEqual(events[-1], ("finish", "tool_calls"))
 
     def test_error_before_output_is_retried(self):
         gen = _FakeGen(RuntimeError("boom"), "fine")

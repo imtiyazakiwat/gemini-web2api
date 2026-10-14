@@ -85,7 +85,7 @@ def _image_from_part(part: dict):
 
 # Above this size the tool list is slimmed so the prompt is not silently
 # truncated upstream.
-TOOLS_JSON_MAX_CHARS = 30000
+TOOLS_JSON_MAX_CHARS = 60000
 
 
 def normalize_tools(tools: list) -> list:
@@ -171,13 +171,35 @@ def _tool_spec_lines(tool_defs: list) -> str:
     lines = [json.dumps(d, ensure_ascii=False) for d in tool_defs]
     if sum(len(x) for x in lines) <= TOOLS_JSON_MAX_CHARS:
         return "\n".join(lines)
-    # Drop nested parameter descriptions first, then parameters entirely.
-    lines = [json.dumps({**d, "parameters": _strip_param_descriptions(d["parameters"])}, ensure_ascii=False)
-             for d in tool_defs]
-    if sum(len(x) for x in lines) <= TOOLS_JSON_MAX_CHARS:
-        return "\n".join(lines)
-    return "\n".join(json.dumps({"name": d["name"], "description": d["description"]}, ensure_ascii=False)
-                     for d in tool_defs)
+    # Over budget: strip nested parameter descriptions, then give full
+    # schemas to the smallest tools first (core tools like read/edit/bash are
+    # usually small; MCP servers can add huge ones). Tools that do not fit
+    # keep their name, a shortened description and their parameter names.
+    compact = [{**d, "description": d["description"][:1500],
+                "parameters": _strip_param_descriptions(d["parameters"])} for d in tool_defs]
+    slim = []
+    for d in compact:
+        params = d["parameters"] if isinstance(d["parameters"], dict) else {}
+        props = params.get("properties") if isinstance(params.get("properties"), dict) else {}
+        desc = d["description"].split("\n", 1)[0][:160]
+        entry = {"name": d["name"], "description": desc}
+        if props:
+            entry["parameter_names"] = list(props)
+        slim.append(json.dumps(entry, ensure_ascii=False))
+    full = [json.dumps(d, ensure_ascii=False) for d in compact]
+    # Tools sharing a prefix with many siblings (e.g. one MCP server's
+    # "rea_*" tools) are ranked after standalone tools.
+    prefix = [re.split(r"[_.:\-]", d["name"], maxsplit=1)[0] for d in compact]
+    group = {p: prefix.count(p) for p in set(prefix)}
+    order = sorted(range(len(full)), key=lambda i: (group[prefix[i]] >= 5, len(full[i])))
+    budget = TOOLS_JSON_MAX_CHARS - sum(len(x) for x in slim)
+    chosen = list(slim)
+    for i in order:
+        extra = len(full[i]) - len(slim[i])
+        if extra <= budget:
+            chosen[i] = full[i]
+            budget -= extra
+    return "\n".join(chosen)
 
 
 def build_openai_tool_prompt(tool_defs: list) -> str:
@@ -292,9 +314,11 @@ def messages_to_prompt(messages: list, tools: list = None, tool_choice=None,
 
     reminder = []
     if tool_defs:
-        reminder.append("Continue as the assistant. Use the tool results above to work on the user's latest "
-                        "request. To call a tool, output only tool_call blocks and then stop; results come back "
-                        "in the next message. When you have what you need, answer in plain text.")
+        reminder.append("Continue as the assistant and keep working on the user's latest request. Showing "
+                        "code is not the same as changing a file: to create or modify files or run commands you "
+                        "must call the tools. To call a tool, output only tool_call blocks and then stop; results "
+                        "come back in the next message. Reply in plain text only when the request is fully done "
+                        "or no tool can help.")
         choice = _tool_choice_instruction(tool_choice)
         if choice:
             reminder.append(choice)

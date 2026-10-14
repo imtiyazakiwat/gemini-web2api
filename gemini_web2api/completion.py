@@ -44,6 +44,43 @@ _REFUSAL_PATTERNS = [
     r"i'?m a text-based ai,? (?:and|so) that is outside of my capabilities",
     r"i can'?t assist (?:you )?with that,? as i'?m only a language model",
 ]
+# Replies that open with one of these are failures even when the model keeps
+# writing advice afterwards (observed with opencode: "I cannot execute tools
+# directly because the tool call limit has been reached. However, ...").
+_LEAD_FAILURE_PATTERNS = [
+    r"\bi (?:cannot|can'?t|am unable to|'?m unable to|am not able to|'?m not able to) "
+    r"(?:execute|make|call|run|perform|use|access)(?: any| the)?(?: additional| more| further| file)?"
+    r" (?:tool|function)",
+    r"\b(?:tool|function)[ -]call(?:ing)?s? (?:limit (?:has been |was )?reached|are exhausted|have been exhausted)",
+    r"\bmaximum (?:number of )?(?:tool calls|tool call limit|call limit|limit) (?:has been |was )?reached",
+    r"\bi(?: am|'m)? (?:unable|not able|cannot|can'?t)\b.{0,120}\b(?:tools?|tool calls?) (?:are|is) "
+    r"(?:currently |temporarily )?(?:unavailable|disabled|not available)",
+    r"\b(?:tools?|tool calls?) (?:are|is) (?:currently |temporarily )?(?:unavailable|disabled|not available)"
+    r"\b.{0,120}\bi(?: am|'m)? (?:unable|not able|cannot|can'?t)\b",
+    r"\bi(?: am|'m)? (?:unable|not able|cannot|can'?t) to (?:run|use|access|call|execute)\b[^.]{0,60}\btools?\b",
+    r"\bwithout (?:tool|file) access\b",
+]
+
+# A reply that explains how to make the change (code blocks plus
+# "here are the changes" phrasing) instead of calling the tools. Gets one
+# corrective retry when tools are available.
+_TUTORIAL_PATTERNS = [
+    r"\byou can (?:use|make|apply|follow|add|update)\b",
+    r"\bhere (?:are|is) (?:the )?(?:changes|updates|code|steps)\b",
+    r"\bfollow(?:ing)? (?:these )?steps\b",
+    r"\b(?:add|include|use) the following\b",
+    r"\bto (?:complete|fulfill|accomplish) (?:your|this|the) request\b",
+]
+
+
+def tutorial_phrasing(text: str) -> bool:
+    t = (text or "").lower()[:600]
+    return any(re.search(p, t) for p in _TUTORIAL_PATTERNS)
+
+
+def looks_like_tutorial(text: str) -> bool:
+    return "```" in (text or "") and tutorial_phrasing(text)
+_LEAD_CHARS = 200
 _CANNED_MAX_CHARS = 300
 # For tool requests, this many leading characters are held back while
 # streaming so a canned reply can still be detected and retried.
@@ -55,6 +92,9 @@ def classify_canned(text: str):
     if not text:
         return None
     t = text.strip().lower().replace("\u2019", "'")
+    if any(re.search(p, t[:_LEAD_CHARS]) for p in _LEAD_FAILURE_PATTERNS):
+        # Retried, but returned as-is if it persists (may be a real answer).
+        return "refusal"
     if len(t) > _CANNED_MAX_CHARS:
         return None
     if any(re.search(p, t) for p in _FAILURE_PATTERNS):
@@ -139,6 +179,11 @@ def _correction(req: CompletionRequest, parsed) -> str:
             notes.append(f"Your previous reply contained tool calls that could not be used ({reasons}). "
                          f"Only these tools exist: {', '.join(sorted(req.valid_names))}. "
                          "Call one of them with valid JSON arguments, or answer in plain text.")
+        if (not parsed.tool_calls and not parsed.rejected and not req.require_call
+                and looks_like_tutorial(parsed.text)):
+            notes.append("You described the changes instead of making them. You have working tools: "
+                         "call them to read, edit or create files and run commands. If the request is "
+                         "really finished, reply in plain text again.")
         if req.require_call:
             ok_names = {tc["function"]["name"] for tc in parsed.tool_calls}
             if req.forced_name and req.forced_name not in ok_names:
@@ -252,6 +297,11 @@ def complete_stream(stream_fn, req: CompletionRequest):
                 if req.use_tools:
                     if emitted == 0 and len(full) < CANNED_PROBE_CHARS and not stopped:
                         continue  # hold back the start: it may be a canned failure
+                    if emitted == 0 and not last and classify_canned(full[:CANNED_PROBE_CHARS]):
+                        break  # long canned failure/refusal: stop reading, retry below
+                    if emitted == 0 and not last and tutorial_phrasing(full) and tool_start == -1 \
+                            and find_tool_call_start(full, 0) == -1:
+                        continue  # may be "here are the changes": hold so it can be retried
                     if tool_start == -1:
                         tool_start = find_tool_call_start(full, emitted, at_reply_start=emitted == 0)
                     limit = tool_start if tool_start != -1 else safe_emit_boundary(full, emitted)
@@ -274,6 +324,8 @@ def complete_stream(stream_fn, req: CompletionRequest):
         if emitted == 0:
             full = full[echo_prefix_len(full):]
             kind = classify_canned(full)
+            if not kind and req.use_tools:
+                kind = classify_canned(full[:CANNED_PROBE_CHARS])
             if kind or not full.strip():
                 _log(f"Gemini returned {'an empty reply' if not kind else 'canned ' + kind}"
                      f" (attempt {attempt + 1}/{_attempts()}): {full[:80]!r}")
